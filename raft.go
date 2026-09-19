@@ -1,4 +1,5 @@
-// Raft leader election and log replication, Figure 2 of the Raft paper.
+// Package raft implements Raft leader election and log
+// replication.
 package raft
 
 import (
@@ -12,7 +13,8 @@ import (
 	"6.5840/tester1"
 )
 
-// Election timeout is several heartbeats so a live leader is never mistaken for a dead one.
+// Heartbeat and election timeouts; the timeout window sits well
+// above heartbeatInterval so followers don't time out early.
 const (
 	heartbeatInterval    = 100 * time.Millisecond
 	electionTimeoutMin   = 300 * time.Millisecond
@@ -20,19 +22,26 @@ const (
 	electionPollInterval = 20 * time.Millisecond
 )
 
+// LogEntry is one replicated log slot: a client command tagged
+// with the term the leader appended it in.
 type LogEntry struct {
 	Command interface{}
 	Term    int
 }
 
+// serverRole is the role a Raft peer holds in the current term.
 type serverRole int
 
+// The three roles; follower is the zero value, so a peer starts
+// in that role before its ticker runs.
 const (
 	follower serverRole = iota
 	candidate
 	leader
 )
 
+// Raft holds one replica's state; mu guards every field except
+// applyCh, which only the applier goroutine sends on.
 type Raft struct {
 	mu        sync.Mutex
 	peers     []*labrpc.ClientEnd
@@ -56,6 +65,8 @@ type Raft struct {
 	applyCond *sync.Cond
 }
 
+// Make constructs a Raft peer and starts its ticker, heartbeat,
+// and applier goroutines.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{
@@ -69,7 +80,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-	// Randomised per peer so split votes resolve quickly.
 	rf.resetElectionDeadline()
 
 	rf.readPersist(persister.ReadRaftState())
@@ -81,12 +91,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+// GetState reports the current term and whether this peer is leader.
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.role == leader
 }
 
+// Start appends command to the log if this peer is leader and
+// returns the index it will occupy, without waiting for commit.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -100,15 +113,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return rf.lastLogIndex(), rf.currentTerm, true
 }
 
+// Snapshot is a stub; this version never compacts its log.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
+// PersistBytes reports the persisted Raft state size in bytes;
+// the service compares it to its snapshot threshold.
 func (rf *Raft) PersistBytes() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.persister.RaftStateSize()
 }
 
+// ticker fires an election when no heartbeat has reset the
+// election deadline in time; runs for the life of the peer.
 func (rf *Raft) ticker() {
 	for {
 		rf.mu.Lock()
@@ -120,7 +138,8 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// Leaders send empty AppendEntries at a fixed interval to hold followers' election timers.
+// heartbeatLoop sends AppendEntries to all peers on a fixed
+// interval whenever this peer is leader.
 func (rf *Raft) heartbeatLoop() {
 	for {
 		rf.mu.Lock()
@@ -132,6 +151,8 @@ func (rf *Raft) heartbeatLoop() {
 	}
 }
 
+// applier delivers committed entries to applyCh in log order,
+// releasing mu around every channel send.
 func (rf *Raft) applier() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -145,13 +166,13 @@ func (rf *Raft) applier() {
 			Command:      rf.log[rf.lastApplied].Command,
 			CommandIndex: rf.lastApplied,
 		}
-		// Applies outside the lock so a slow consumer never stalls the protocol.
 		rf.mu.Unlock()
 		rf.applyCh <- message
 		rf.mu.Lock()
 	}
 }
 
+// RequestVoteArgs is the RequestVote RPC request.
 type RequestVoteArgs struct {
 	Term         int
 	CandidateId  int
@@ -159,11 +180,14 @@ type RequestVoteArgs struct {
 	LastLogTerm  int
 }
 
+// RequestVoteReply is the RequestVote RPC response.
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
 }
 
+// RequestVote handles a candidate's vote request; grants a vote
+// only if the candidate's log is at least as up to date.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -178,11 +202,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	lastIndex := rf.lastLogIndex()
 	lastTerm := rf.log[lastIndex].Term
-	// Section 5.4.1: refuse a candidate whose log is behind ours.
 	candidateUpToDate := args.LastLogTerm > lastTerm ||
 		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
 
-	// One vote per term; a repeat request from the same candidate is granted again for idempotence.
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && candidateUpToDate {
 		rf.votedFor = args.CandidateId
 		rf.persist()
@@ -191,10 +213,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
+// sendRequestVote issues the RPC and reports whether it was
+// delivered; false means no information about the peer's state.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	return rf.peers[server].Call("Raft.RequestVote", args, reply)
 }
 
+// startElection bumps the term, votes for self, and asks every
+// peer for a vote in parallel; the caller holds mu.
 func (rf *Raft) startElection() {
 	rf.role = candidate
 	rf.currentTerm++
@@ -240,6 +266,8 @@ func (rf *Raft) startElection() {
 	}
 }
 
+// becomeLeader resets nextIndex and matchIndex and sends a first
+// round of AppendEntries; the caller holds mu.
 func (rf *Raft) becomeLeader() {
 	rf.role = leader
 	for peer := range rf.peers {
@@ -249,6 +277,8 @@ func (rf *Raft) becomeLeader() {
 	rf.broadcastAppendEntries()
 }
 
+// AppendEntriesArgs is the AppendEntries RPC request, doubling
+// as the heartbeat when Entries is empty.
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
@@ -258,6 +288,8 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+// AppendEntriesReply is the AppendEntries RPC response, carrying
+// conflict info the leader uses to backtrack nextIndex.
 type AppendEntriesReply struct {
 	Term          int
 	Success       bool
@@ -265,6 +297,8 @@ type AppendEntriesReply struct {
 	ConflictIndex int
 }
 
+// AppendEntries handles a leader's replication or heartbeat
+// request, rejecting stale terms and reporting log conflicts.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -285,7 +319,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictIndex = rf.lastLogIndex() + 1
 		return
 	}
-	// Report the conflicting term so the leader can back up a whole term per RPC, not one entry.
+	// On a term mismatch, walk back to that term's first index
+	// so the leader can skip it in one round trip.
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
 		firstIndexOfTerm := args.PrevLogIndex
@@ -296,6 +331,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// Truncate only at a real term conflict, so a delayed RPC
+	// cannot erase entries a later one appended.
 	for offset, entry := range args.Entries {
 		position := args.PrevLogIndex + 1 + offset
 		if position <= rf.lastLogIndex() {
@@ -316,6 +353,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
+// broadcastAppendEntries replicates to every other peer without
+// waiting for replies; the caller holds mu.
 func (rf *Raft) broadcastAppendEntries() {
 	for peer := range rf.peers {
 		if peer == rf.me {
@@ -325,6 +364,8 @@ func (rf *Raft) broadcastAppendEntries() {
 	}
 }
 
+// replicateToPeer sends one peer the log suffix after nextIndex
+// and handles the reply; the caller holds mu.
 func (rf *Raft) replicateToPeer(peer int) {
 	prevLogIndex := rf.nextIndex[peer] - 1
 	args := &AppendEntriesArgs{
@@ -361,6 +402,7 @@ func (rf *Raft) replicateToPeer(peer int) {
 			return
 		}
 
+		// Ignore a reject for an outdated nextIndex.
 		if rf.nextIndex[peer] != args.PrevLogIndex+1 {
 			return
 		}
@@ -369,8 +411,11 @@ func (rf *Raft) replicateToPeer(peer int) {
 	}()
 }
 
-// Fast backup from the follower's conflict hint instead of decrementing nextIndex by one.
+// backtrackedNextIndex picks the next index to try after a
+// rejected AppendEntries, using the follower's conflict term.
 func (rf *Raft) backtrackedNextIndex(reply *AppendEntriesReply) int {
+	// Scan back for the newest entry in the conflict term; if
+	// none remain, fall back to the reported index.
 	if reply.ConflictTerm != -1 {
 		for index := rf.lastLogIndex(); index >= 1; index-- {
 			if rf.log[index].Term == reply.ConflictTerm {
@@ -381,21 +426,27 @@ func (rf *Raft) backtrackedNextIndex(reply *AppendEntriesReply) int {
 	return max(reply.ConflictIndex, 1)
 }
 
+// advanceCommitIndex commits the highest current-term index a
+// majority has stored; the caller holds mu.
 func (rf *Raft) advanceCommitIndex() {
 	matched := make([]int, len(rf.peers))
 	copy(matched, rf.matchIndex)
 	matched[rf.me] = rf.lastLogIndex()
 	sort.Ints(matched)
+	// After the ascending sort, this slot is the highest index
+	// that a majority of peers have reached.
 	majorityMatchIndex := matched[(len(matched)-1)/2]
 
-	// Section 5.4.2: only entries from the current term are committed by counting replicas.
+	// Committing only entries from this term avoids exposing a
+	// lower-term entry a future leader could still overwrite.
 	if majorityMatchIndex > rf.commitIndex && rf.log[majorityMatchIndex].Term == rf.currentTerm {
 		rf.commitIndex = majorityMatchIndex
 		rf.applyCond.Signal()
 	}
 }
 
-// Any RPC carrying a higher term demotes us immediately.
+// becomeFollower adopts a higher term and clears the vote so
+// the peer can vote in it; the caller holds mu.
 func (rf *Raft) becomeFollower(term int) {
 	rf.role = follower
 	rf.currentTerm = term
@@ -403,20 +454,26 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.persist()
 }
 
+// resetElectionDeadline picks a randomized deadline so peers
+// don't all start elections at the same instant.
 func (rf *Raft) resetElectionDeadline() {
 	timeoutRange := int64(electionTimeoutMax - electionTimeoutMin)
 	timeout := electionTimeoutMin + time.Duration(rand.Int63n(timeoutRange))
 	rf.electionDeadline = time.Now().Add(timeout)
 }
 
+// lastLogIndex returns the index of the last log entry; log[0]
+// is a sentinel, so real entries start at index 1.
 func (rf *Raft) lastLogIndex() int {
 	return len(rf.log) - 1
 }
 
-// Persistence is out of scope here.
+// persist is a stub; this version keeps no durable state.
 func (rf *Raft) persist() {
 }
 
+// readPersist is a stub; a restarted peer begins with an empty
+// log.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 {
 		return
