@@ -1,6 +1,6 @@
 # Concord
 
-Raft consensus in Go. One file, 412 lines.
+Raft consensus in Go.
 
 Raft is how a group of servers agrees on a single ordered log even when some of them crash or
 lose contact. One server is elected leader. It takes new entries, sends them to the others, and
